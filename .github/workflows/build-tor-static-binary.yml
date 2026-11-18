@@ -1,12 +1,7 @@
 name: Build tor static binaries
 
 on:
-  #push:
-  #  branches:
-  #    - main
-  workflow_dispatch
-  #schedule:
-  #  - cron: '5 5 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -37,7 +32,6 @@ env:
   TOR_STATIC_BUILD_PATH: "/tmp/tor_static"
   TOR_STATIC_PACKAGE_DIR_PATH: "/tmp/tor_package"
   
-
 defaults:
   run:
     shell: bash
@@ -47,22 +41,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        #ARCH: [x86_64, aarch64]
-        #LIBC: [glibc, musl]
         ARCH: [x86_64]
         LIBC: [glibc]
         include:
           - OS: ubuntu-latest
             ARCH: x86_64
-          
-          #- OS: ubuntu-24.04-arm
-          #  ARCH: aarch64
 
           - CONTAINER: debian:trixie
             LIBC: glibc
-
-          #- CONTAINER: alpine:latest
-          #  LIBC: musl
             
     runs-on: ${{ matrix.OS }}
     
@@ -77,16 +63,8 @@ jobs:
 
     outputs:
       TOR_VERSION: ${{ steps.release_version.outputs.TOR_VERSION }}
-      ARTIFACT_ARM64_MUSL_ZIP_URL: ${{ steps.artifact_arm64_musl_urls.outputs.ARTIFACT_ARM64_MUSL_ZIP_URL }}
-      ARTIFACT_ARM64_MUSL_HASH_URL: ${{ steps.artifact_arm64_musl_urls.outputs.ARTIFACT_ARM64_MUSL_HASH_URL }}
   
     steps:
-    - name: Install bash prerequisites for alpine
-      if: contains(env.CONTAINER, 'alpine')
-      run: |
-        apk -q update && apk add bash
-      shell: sh
-      
     - name: Install prerequisites
       run: |
         if [[ $CONTAINER =~ "debian" ]]; then
@@ -94,11 +72,6 @@ jobs:
           
           dpkg --get-selections | grep -i libssl
           $APT autoremove --purge libssl-dev
-        fi
-        
-        if [[ $CONTAINER =~ "alpine" ]]; then
-          apk -q update && apk add build-base file sudo bash shadow musl wget make tar perl linux-headers pkgconfig zip coreutils curl
-          apk del openssl-dev
         fi
         
         sudo chsh root -s /bin/bash
@@ -114,8 +87,7 @@ jobs:
         wget -nv $ZLIB_DL -O $ZLIB_TAR_PATH
         wget -nv $LIBEVENT_DL -O $LIBEVENT_TAR_PATH
         wget -nv $TOR_DL -O $TOR_TAR_PATH
-        
-    
+
     - name: Compile OpenSSL
       run: |
         cd /tmp/
@@ -131,7 +103,6 @@ jobs:
         if [[ $ARCH =~ "aarch64" ]]; then
           echo "OPENSSL_LIB_DIR=$OPENSSL_BUILD_PATH/lib" >> $GITHUB_ENV
           echo "OPENSSL_LIB_DIR_PKGCONFIG=$OPENSSL_BUILD_PATH/lib/pkgconfig" >> $GITHUB_ENV
-        
         elif [[ $ARCH =~ "x86_64" ]]; then
           echo "OPENSSL_LIB_DIR=$OPENSSL_BUILD_PATH/lib64" >> $GITHUB_ENV
           echo "OPENSSL_LIB_DIR_PKGCONFIG=$OPENSSL_BUILD_PATH/lib64/pkgconfig" >> $GITHUB_ENV
@@ -148,7 +119,6 @@ jobs:
         make install
 
         find $ZLIB_BUILD_PATH -type f -exec ls -alh {} \;
-
 
     - name: Compile Libevent
       run: |
@@ -189,7 +159,6 @@ jobs:
         ldd "$TOR_STATIC_BUILD_PATH/bin/tor" || true
         "$TOR_STATIC_BUILD_PATH/bin/tor" --version
 
-
     - name: Make package
       id: release_version
       run: |
@@ -209,29 +178,13 @@ jobs:
         tar -czvf "$TOR_STATIC_PACKAGE_FILENAME" "$TOR_STATIC_BUILD_PATH"
         sha256sum --tag "$(basename "$TOR_STATIC_PACKAGE_FILENAME")" | tee "$TOR_STATIC_PACKAGE_HASH_PATH"
 
-      
-    - name: Upload artifact for all containers except arm64-musl
-      uses: actions/upload-artifact@v7
-      if: ${{ !(contains(env.ARCH, 'aarch64') && contains(env.LIBC, 'musl')) }}
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
         name: binary-${{ matrix.ARCH }}-${{ matrix.LIBC }}
         path: |
           ${{ env.TOR_STATIC_PACKAGE_FILE_PATH }}
           ${{ env.TOR_STATIC_PACKAGE_HASH_PATH }}
-
-
-    # this is step is necessary because Alpine ARM64 is not supported by the "upload-artifact"" action (cf. https://github.com/actions/upload-artifact/issues/739)
-    - name: Upload artifact for arm64-musl
-      id: artifact_arm64_musl_urls
-      if: ${{ contains(env.ARCH, 'aarch64') && contains(env.LIBC, 'musl') }}
-      run: |
-        cd /tmp/
-        ARTIFACT_ARM64_MUSL_ZIP_URL=$(curl -sS --upload-file $TOR_STATIC_PACKAGE_FILE_PATH https://transfer.adminforge.de)
-        ARTIFACT_ARM64_MUSL_HASH_URL=$(curl -sS --upload-file $TOR_STATIC_PACKAGE_HASH_PATH https://transfer.adminforge.de)
-
-        echo "ARTIFACT_ARM64_MUSL_ZIP_URL=$ARTIFACT_ARM64_MUSL_ZIP_URL" >> $GITHUB_OUTPUT
-        echo "ARTIFACT_ARM64_MUSL_HASH_URL=$ARTIFACT_ARM64_MUSL_HASH_URL" >> $GITHUB_OUTPUT
-        
 
 ######################################################
 
@@ -240,25 +193,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
        TOR_VERSION: ${{ needs.build.outputs.TOR_VERSION }}
-       ARTIFACT_ARM64_MUSL_ZIP_URL: ${{ needs.build.outputs.ARTIFACT_ARM64_MUSL_ZIP_URL }}
-       ARTIFACT_ARM64_MUSL_HASH_URL: ${{ needs.build.outputs.ARTIFACT_ARM64_MUSL_HASH_URL }}
     
     steps:
      - name: Download artifacts
-       uses: actions/download-artifact@v8
+       uses: actions/download-artifact@v4
        with:
         pattern: binary-*
         merge-multiple: true
         path: /tmp/results
-
-     #- name: Download arm64-musl artifact
-     #  run: |
-     #    cd "/tmp/results"
-     #    wget -nv "$ARTIFACT_ARM64_MUSL_ZIP_URL"
-     #    wget -nv "$ARTIFACT_ARM64_MUSL_HASH_URL"
-
-     #    sha256sum -c *-aarch64-musl.tar.gz.sha256.txt
-         
+  
      - name: List builds
        run: |
           cd "/tmp/results"
@@ -272,7 +215,7 @@ jobs:
           mv -f *.sha256.txt "/tmp/hashes/"
   
      - name: Create a new Github release
-       uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b #v3.0.1
+       uses: softprops/action-gh-release@v2
        with:
          make_latest: true
          body_path: ${{ env.RELEASE_NOTES }}
