@@ -1,0 +1,69 @@
+name: Extract Vaultwarden Binaries
+
+on:
+  workflow_dispatch: # Allows manual triggering from the GitHub Actions tab
+  #schedule:
+  #  - cron: '0 0 * * 1' # (Optional) Runs automatically every Monday to check for updates
+
+jobs:
+  extract:
+    name: Extract and Release Vaultwarden
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Required write permission to create a GitHub Release
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pull Vaultwarden Docker Image
+        run: docker pull vaultwarden/server:latest
+
+      - name: Create temporary container and extract files
+        run: |
+          # Create a temporary container without starting it
+          CONTAINER_ID=$(docker create vaultwarden/server:latest)
+          
+          echo "Container ID: $CONTAINER_ID"
+          
+          # Create a directory to store the extracted files
+          mkdir -p extracted-files/web-vault
+          
+          # Copy the vaultwarden binary from /vaultwarden
+          docker cp $CONTAINER_ID:/vaultwarden ./extracted-files/vaultwarden
+          
+          # Copy the web-vault directory from /web-vault
+          docker cp $CONTAINER_ID:/web-vault/. ./extracted-files/web-vault/
+          
+          # Remove the temporary container
+          docker rm $CONTAINER_ID
+          
+          # Ensure execute permission is set for the binary
+          chmod +x ./extracted-files/vaultwarden
+          
+          # Verify file size and directory contents
+          ls -la ./extracted-files/
+
+      - name: Get version info
+        id: version
+        run: |
+          # Extract the version directly from the vaultwarden binary
+          VW_VERSION=$(./extracted-files/vaultwarden --version | awk '{print $2}')
+          echo "Extracted version: $VW_VERSION"
+          echo "tag_name=v${VW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Compress extracted files
+        run: |
+          cd extracted-files
+          tar -czvf ../vaultwarden-linux-amd64.tar.gz vaultwarden web-vault
+          cd ..
+
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag_name }}
+          name: "Vaultwarden Binaries ${{ steps.version.outputs.tag_name }}"
+          body: "Automatically extracted `vaultwarden` binary and `web-vault` directory from the official `vaultwarden/server:latest` image."
+          files: |
+            vaultwarden-linux-amd64.tar.gz
