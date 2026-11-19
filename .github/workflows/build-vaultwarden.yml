@@ -108,7 +108,7 @@ jobs:
 
           apt-get -o Acquire::Check-Valid-Until=false update
           DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
-            ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev
+            ca-certificates curl git build-essential pkg-config perl zlib1g-dev libsqlite3-dev
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Rust toolchain
@@ -126,6 +126,33 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "$GIT_TAG" https://github.com/dani-garcia/vaultwarden.git /tmp/vw-src
 
+      - name: Build OpenSSL 3 for Debian 11
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENSSL_VER="3.0.15"
+          curl -fsSL "https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz" -o /tmp/openssl.tar.gz
+          tar -xzf /tmp/openssl.tar.gz -C /tmp
+          cd "/tmp/openssl-${OPENSSL_VER}"
+
+          ./Configure linux-x86_64 \
+            --prefix=/opt/openssl3 \
+            --openssldir=/opt/openssl3/ssl \
+            no-shared zlib
+
+          make -j"$(nproc)"
+          make install_sw
+
+          rm -rf /tmp/openssl.tar.gz "/tmp/openssl-${OPENSSL_VER}"
+
+          {
+            echo "OPENSSL_DIR=/opt/openssl3"
+            echo "OPENSSL_LIB_DIR=/opt/openssl3/lib64"
+            echo "OPENSSL_INCLUDE_DIR=/opt/openssl3/include"
+            echo "OPENSSL_STATIC=1"
+            echo "PKG_CONFIG_PATH=/opt/openssl3/lib64/pkgconfig:/opt/openssl3/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+      
       - name: Build Vaultwarden (SQLite)
         shell: bash
         env:
