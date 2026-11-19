@@ -138,7 +138,7 @@ jobs:
           ./Configure linux-x86_64 \
             --prefix=/opt/openssl3 \
             --openssldir=/opt/openssl3/ssl \
-            no-shared zlib
+            no-shared no-zlib
 
           make -j"$(nproc)"
           make install_sw
