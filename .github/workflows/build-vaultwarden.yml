@@ -1,0 +1,192 @@
+name: Build Vaultwarden & Web Vault (Debian 11)
+
+on:
+  #schedule:
+  #  - cron: "0 3 * * *" # Kiểm tra bản mới mỗi ngày lúc 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Vaultwarden muốn build (để trống để tự lấy bản mới nhất, vd: 1.37.5)"
+        required: false
+        type: string
+      force:
+        description: "Ghi đè nếu release đã tồn tại"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      web_vault_version: ${{ steps.ver.outputs.web_vault_version }}
+      should_run: ${{ steps.ver.outputs.should_run }}
+    steps:
+      - name: Determine target Vaultwarden version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE_RUN: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$INPUT_VERSION" ]; then
+            VW_VER="${INPUT_VERSION#v}"
+          else
+            LATEST_TAG=$(curl -fsSL https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r '.tag_name // empty')
+            if [ -z "$LATEST_TAG" ]; then
+              LATEST_TAG=$(curl -fsSL https://api.github.com/repos/dani-garcia/vaultwarden/tags | jq -r '.[0].name')
+            fi
+            VW_VER="${LATEST_TAG#v}"
+          fi
+
+          if [ -z "$VW_VER" ]; then
+            echo "Không xác định được version Vaultwarden." >&2
+            exit 1
+          fi
+
+          # Lấy version web-vault tương ứng từ Cargo.toml của Vaultwarden (fallback sang latest nếu không parse được)
+          CARGO_TOML=$(curl -fsSL "https://raw.githubusercontent.com/dani-garcia/vaultwarden/${VW_VER}/Cargo.toml" || true)
+          WV_VER=$(echo "$CARGO_TOML" | grep -E '^version\s*=' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          if [[ "$WV_VER" != 202* ]]; then
+            WV_VER=""
+          fi
+
+          # Kiểm tra xem release đã tồn tại ở repo hiện tại chưa
+          EXISTS="false"
+          if gh release view "$VW_VER" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+             gh release view "v${VW_VER}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            EXISTS="true"
+          fi
+
+          SHOULD_RUN="true"
+          if [ "$EXISTS" = "true" ] && [ "$FORCE_RUN" != "true" ]; then
+            SHOULD_RUN="false"
+          fi
+
+          echo "version=$VW_VER" >> "$GITHUB_OUTPUT"
+          echo "web_vault_version=$WV_VER" >> "$GITHUB_OUTPUT"
+          echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
+          echo "Target Vaultwarden: $VW_VER | Web Vault hint: ${WV_VER:-latest} | Should run: $SHOULD_RUN"
+
+  build-vaultwarden-deb11:
+    needs: resolve-version
+    if: ${{ needs.resolve-version.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    container:
+      image: debian:11-slim
+    steps:
+      - name: Install build dependencies (Debian 11)
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout Vaultwarden source
+        env:
+          VW_VER: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$VW_VER" https://github.com/dani-garcia/vaultwarden.git /tmp/vw-src
+
+      - name: Build Vaultwarden (SQLite)
+        env:
+          VW_VER: ${{ needs.resolve-version.outputs.version }}
+          CARGO_TERM_COLOR: always
+        run: |
+          set -euo pipefail
+          cd /tmp/vw-src
+          cargo build --features sqlite --release
+
+          mkdir -p /tmp/artifacts
+          tar -czf "/tmp/artifacts/vaultwarden-debian11-${VW_VER}-amd64.tar.gz" \
+            -C /tmp/vw-src/target/release vaultwarden
+
+      - name: Upload Vaultwarden artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaultwarden-deb11
+          path: /tmp/artifacts/vaultwarden-debian11-*.tar.gz
+          if-no-files-found: error
+
+  build-web-vault:
+    needs: resolve-version
+    if: ${{ needs.resolve-version.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build Web Vault from vw_web_builds
+        env:
+          VW_VER: ${{ needs.resolve-version.outputs.version }}
+          WV_VER: ${{ needs.resolve-version.outputs.web_vault_version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/vaultwarden/vw_web_builds.git /tmp/vw-web
+
+          cd /tmp/vw-web
+          npm ci
+          pushd apps/web
+          npm run dist:oss:selfhost
+          popd
+
+          mkdir -p /tmp/wv-pkg/web-vault /tmp/artifacts
+          cp -r /tmp/vw-web/apps/web/build/* /tmp/wv-pkg/web-vault/
+
+          ARCHIVE_NAME="web-vault-vw-${VW_VER}.tar.gz"
+          tar -czf "/tmp/artifacts/${ARCHIVE_NAME}" -C /tmp/wv-pkg web-vault
+
+      - name: Upload Web Vault artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-vault-dist
+          path: /tmp/artifacts/web-vault-*.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    needs: [resolve-version, build-vaultwarden-deb11, build-web-vault]
+    if: ${{ needs.resolve-version.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd /tmp/release-assets
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          VW_VER: ${{ needs.resolve-version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VW_VER" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$VW_VER" /tmp/release-assets/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$VW_VER" /tmp/release-assets/* \
+              --repo "${{ github.repository }}" \
+              --title "Vaultwarden ${VW_VER} (Debian 11)" \
+              --notes "Automated build for **Debian 11 (Bullseye)** (SQLite) and matching **Web Vault** for Vaultwarden \`${VW_VER}\`."
+          fi
