@@ -1,8 +1,8 @@
-name: Build Vaultwarden & Fetch Web Vault (Debian 11)
+name: Build Vaultwarden & Web Vault (Debian 11)
 
 on:
-  #schedule:
-  #  - cron: "0 3 * * *" # Kiểm tra bản mới mỗi ngày lúc 03:00 UTC
+  schedule:
+    - cron: "0 3 * * *" # Kiểm tra bản mới mỗi ngày lúc 03:00 UTC
   workflow_dispatch:
     inputs:
       version:
@@ -24,9 +24,10 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       git_tag: ${{ steps.ver.outputs.git_tag }}
+      wv_tag: ${{ steps.ver.outputs.wv_tag }}
       should_run: ${{ steps.ver.outputs.should_run }}
     steps:
-      - name: Determine target Vaultwarden version
+      - name: Determine target Vaultwarden & Web Vault versions
         id: ver
         shell: bash
         env:
@@ -39,9 +40,13 @@ jobs:
           if [ -n "$INPUT_VERSION" ]; then
             VW_VER="${INPUT_VERSION#v}"
           else
-            LATEST_TAG=$(curl -fsSL https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r '.tag_name // empty')
+            LATEST_TAG=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r '.tag_name // empty')
             if [ -z "$LATEST_TAG" ]; then
-              LATEST_TAG=$(curl -fsSL https://api.github.com/repos/dani-garcia/vaultwarden/tags | jq -r '.[0].name')
+              LATEST_TAG=$(curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                https://api.github.com/repos/dani-garcia/vaultwarden/tags | jq -r '.[0].name')
             fi
             VW_VER="${LATEST_TAG#v}"
           fi
@@ -51,7 +56,6 @@ jobs:
             exit 1
           fi
 
-          # Xác định chính xác tên tag trên repo gốc (có 'v' hoặc không có 'v')
           if git ls-remote --tags --exit-code https://github.com/dani-garcia/vaultwarden.git "refs/tags/${VW_VER}" >/dev/null 2>&1; then
             GIT_TAG="${VW_VER}"
           elif git ls-remote --tags --exit-code https://github.com/dani-garcia/vaultwarden.git "refs/tags/v${VW_VER}" >/dev/null 2>&1; then
@@ -61,7 +65,16 @@ jobs:
             exit 1
           fi
 
-          # Kiểm tra xem release đã tồn tại ở repo hiện tại chưa
+          # Thử lấy tag mới nhất của vw_web_builds để checkout đúng bản web vault
+          WV_TAG=$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/vaultwarden/vw_web_builds/releases/latest | jq -r '.tag_name // empty' || true)
+          if [ -z "$WV_TAG" ] || [ "$WV_TAG" = "null" ]; then
+            WV_TAG=$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              https://api.github.com/repos/vaultwarden/vw_web_builds/tags | jq -r '.[0].name // empty' || true)
+          fi
+
           EXISTS="false"
           if gh release view "$VW_VER" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
              gh release view "v${VW_VER}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
@@ -75,8 +88,9 @@ jobs:
 
           echo "version=$VW_VER" >> "$GITHUB_OUTPUT"
           echo "git_tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
+          echo "wv_tag=$WV_TAG" >> "$GITHUB_OUTPUT"
           echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
-          echo "Target Vaultwarden: $VW_VER (tag: $GIT_TAG) | Should run: $SHOULD_RUN"
+          echo "Target VW: $VW_VER ($GIT_TAG) | WV tag: ${WV_TAG:-HEAD} | Should run: $SHOULD_RUN"
 
   build-vaultwarden-deb11:
     needs: resolve-version
@@ -89,8 +103,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g; s|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' /etc/apt/sources.list
+          find /etc/apt/sources.list.d/ -type f -name '*.list' -exec sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|g; s|http://security.debian.org/debian-security|http://archive.debian.org/debian-security|g' {} + 2>/dev/null || true
+
+          apt-get -o Acquire::Check-Valid-Until=false update
+          DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev
           rm -rf /var/lib/apt/lists/*
 
@@ -131,31 +148,93 @@ jobs:
           path: /tmp/artifacts/vaultwarden-debian11-*.tar.gz
           if-no-files-found: error
 
-  fetch-web-vault:
+  build-web-vault:
     needs: resolve-version
     if: ${{ needs.resolve-version.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Download latest prebuilt Web Vault
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build Web Vault from source
         shell: bash
         env:
           VW_VER: ${{ needs.resolve-version.outputs.version }}
+          WV_TAG: ${{ needs.resolve-version.outputs.wv_tag }}
+          NODE_OPTIONS: "--max-old-space-size=4096"
         run: |
           set -euo pipefail
-          mkdir -p /tmp/artifacts
 
-          # Lấy URL tải file .tar.gz từ release mới nhất của vaultwarden/vw_web_builds
-          RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/vaultwarden/vw_web_builds/releases/latest)
-          WV_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-          ASSET_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url' | head -n1)
+          if [ -n "$WV_TAG" ]; then
+            git clone --depth 1 --branch "$WV_TAG" https://github.com/vaultwarden/vw_web_builds.git /tmp/vw-web || \
+              git clone --depth 1 https://github.com/vaultwarden/vw_web_builds.git /tmp/vw-web
+          else
+            git clone --depth 1 https://github.com/vaultwarden/vw_web_builds.git /tmp/vw-web
+          fi
 
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "Không tìm thấy file .tar.gz trong release mới nhất của vw_web_builds." >&2
+          cd /tmp/vw-web
+          echo "Cấu trúc repo vw_web_builds:"
+          ls -la
+
+          install_deps_and_build() {
+            local dir="$1"
+            cd "$dir"
+            if [ -f package-lock.json ]; then
+              npm ci
+            elif [ -f package.json ]; then
+              npm install --no-audit --no-fund
+            fi
+          }
+
+          if [ -f package.json ]; then
+            install_deps_and_build "/tmp/vw-web"
+            # Thử chạy các script build phổ biến nếu có
+            for script_name in "dist:oss:selfhost" "build:oss:selfhost" "build"; do
+              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts['$script_name'] ? 0 : 1)" 2>/dev/null; then
+                npm run "$script_name"
+                break
+              fi
+            done
+          fi
+
+          if [ -d /tmp/vw-web/apps/web ]; then
+            install_deps_and_build "/tmp/vw-web/apps/web"
+            for script_name in "dist:oss:selfhost" "build:oss:selfhost" "build"; do
+              if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts['$script_name'] ? 0 : 1)" 2>/dev/null; then
+                npm run "$script_name"
+                break
+              fi
+            done
+          fi
+
+          # Tìm thư mục build đầu ra (ưu tiên web-vault, build, dist)
+          DIST_DIR=""
+          for candidate in \
+            "/tmp/vw-web/web-vault" \
+            "/tmp/vw-web/apps/web/build" \
+            "/tmp/vw-web/build" \
+            "/tmp/vw-web/dist"
+          do
+            if [ -d "$candidate" ] && [ -n "$(ls -A "$candidate" 2>/dev/null)" ]; then
+              DIST_DIR="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$DIST_DIR" ]; then
+            echo "Không tìm thấy thư mục build đầu ra sau khi build." >&2
+            find /tmp/vw-web -maxdepth 3 -not -path '*/node_modules*' >&2
             exit 1
           fi
 
-          echo "Downloading Web Vault ${WV_TAG} from ${ASSET_URL}..."
-          curl -fL "$ASSET_URL" -o "/tmp/artifacts/web-vault-${WV_TAG}-for-vw-${VW_VER}.tar.gz"
+          echo "Đóng gói output từ: $DIST_DIR"
+          mkdir -p /tmp/wv-pkg/web-vault /tmp/artifacts
+          cp -r "${DIST_DIR}/." /tmp/wv-pkg/web-vault/
+
+          ARCHIVE_NAME="web-vault-${WV_TAG:-latest}-for-vw-${VW_VER}.tar.gz"
+          tar -czf "/tmp/artifacts/${ARCHIVE_NAME}" -C /tmp/wv-pkg web-vault
 
       - name: Upload Web Vault artifact
         uses: actions/upload-artifact@v4
@@ -165,7 +244,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    needs: [resolve-version, build-vaultwarden-deb11, fetch-web-vault]
+    needs: [resolve-version, build-vaultwarden-deb11, build-web-vault]
     if: ${{ needs.resolve-version.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -196,5 +275,5 @@ jobs:
             gh release create "$VW_VER" /tmp/release-assets/* \
               --repo "${{ github.repository }}" \
               --title "Vaultwarden ${VW_VER} (Debian 11)" \
-              --notes "Automated build for **Debian 11 (Bullseye)** (SQLite) bundled with latest prebuilt **Web Vault** (\`${WV_FILE}\`)."
+              --notes "Automated build for **Debian 11 (Bullseye)** (SQLite) and built **Web Vault** (\`${WV_FILE}\`)."
           fi
